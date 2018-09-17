@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/credentials"
 
 	"github.com/livepeer/go-livepeer/core"
+	"github.com/livepeer/go-livepeer/drivers"
 	"github.com/livepeer/go-livepeer/eth"
 	lpTypes "github.com/livepeer/go-livepeer/eth/types"
 	"github.com/livepeer/go-livepeer/monitor"
@@ -55,6 +56,8 @@ type Broadcaster interface {
 	GetHTTPClient() *http.Client
 	SetTranscoderInfo(*net.TranscoderInfo)
 	GetTranscoderInfo() *net.TranscoderInfo
+	SetInputOS(ios drivers.OSSession)
+	GetInputOS() drivers.OSSession
 }
 
 func genTranscoderReq(b Broadcaster, jid int64) (*net.TranscoderRequest, error) {
@@ -210,12 +213,23 @@ func getTranscoder(context context.Context, orch Orchestrator, req *net.Transcod
 	for i, s := range sids {
 		stringStreamIds[s.String()] = job.Profiles[i].Name
 	}
+	mid, err := core.StreamID(job.StreamId).ManifestIDFromStreamID()
+	if err != nil {
+		// XXX what to do?
+		glog.Errorf("Error creating manifest id: %v", err)
+	}
+	smid := string(mid)
 
 	tr := net.TranscoderInfo{
 		Transcoder:  orch.ServiceURI().String(), // currently,  orchestrator == transcoder
 		AuthType:    AuthType_LPE,
 		Credentials: creds,
 		StreamIds:   stringStreamIds,
+	}
+	if drivers.ExternalStorage != nil {
+		storageSession := drivers.ExternalStorage.StartSession(req.JobId, smid, 0)
+		piso := storageSession.GetInfo()
+		tr.PreferredIOS = piso
 	}
 	return &tr, nil
 }
@@ -258,6 +272,22 @@ func (h *lphttp) ServeSegment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+	var si net.SegmentInfo
+	if r.Header.Get("Content-Type") == "application/vnd+livepeer.segmentinfo" {
+		err = proto.Unmarshal(data, &si)
+		if err != nil {
+			glog.Error("Invalid segment info ", si)
+			http.Error(w, "BadRequest", http.StatusBadRequest)
+			return
+		}
+		data, err = drivers.GetSegmentData(si.Turi)
+		if err != nil {
+			glog.Errorf("Error getting input segment %v from input OS: %v", si, err)
+			http.Error(w, "BadRequest", http.StatusBadRequest)
+			return
+		}
+	}
+
 	hash := crypto.Keccak256(data)
 	if !bytes.Equal(hash, segData.Hash) {
 		glog.Error("Mismatched hash for body; rejecting")
@@ -292,11 +322,52 @@ func (h *lphttp) ServeSegment(w http.ResponseWriter, r *http.Request) {
 		result = net.TranscodeResult{Result: &net.TranscodeResult_Error{Error: err.Error()}}
 	} else {
 		segments := make([]*net.TranscodedSegmentData, len(res.Urls))
+		mid, _ := core.StreamID(job.StreamId).ManifestIDFromStreamID()
+		smid := string(mid)
+		jid := job.JobId.Int64()
+		var nonce uint64
+		if si.SessionInfo != nil {
+			nonce = si.SessionInfo.Nonce
+		}
+		locSession := drivers.LocalStorage.StartSession(jid, smid, nonce)
 		for i, v := range res.Urls {
+			data := res.Data[i]
+
+			// XXX getting StreamID out of name. Maybe we should return StreamID explicitly?
+			nameParts := strings.Split(v, "_")
+			streamID := nameParts[0]
+
+			// always store to local storage
+			_, vurl, err := locSession.SaveData(streamID, v, data)
+			if err != nil {
+				glog.Errorf("Error saving data into local storage: %v", err)
+			}
 			d := &net.TranscodedSegmentData{
-				Url: orch.ServiceURI().String() + "/stream/" + v,
+				Url: vurl,
 			}
 			segments[i] = d
+			if si.SessionInfo != nil {
+				var outputStorageSession drivers.OSSession
+				if drivers.IsOwnStorage(si.Turi) {
+					outputStorageSession = drivers.ExternalStorage.StartSession(jid, smid, nonce)
+				} else {
+					objectStorage := drivers.NewDriver(si.Turi.Storage, si.SessionInfo.OsInfo)
+					outputStorageSession = objectStorage.StartSession(jid, smid, nonce)
+				}
+				_, surl, err := outputStorageSession.SaveData(streamID, v, data)
+				if err != nil {
+					glog.Errorf("Error saving data into external storage: %v", err)
+				} else {
+					d.Turl = &net.TypedURI{
+						Uri:           surl,
+						UriInManifest: surl,
+						Title:         v,
+						Storage:       si.Turi.Storage,
+						SeqNo:         uint64(segData.Seq),
+						StreamID:      streamID,
+					}
+				}
+			}
 		}
 		result = net.TranscodeResult{Result: &net.TranscodeResult_Data{
 			Data: &net.TranscodeData{
@@ -358,7 +429,7 @@ func StartTranscodeServer(orch Orchestrator, bind string, mux *http.ServeMux, wo
 	srv.ListenAndServeTLS(cert, key)
 }
 
-func StartBroadcastClient(bcast Broadcaster, orchestratorServer string) error {
+func StartBroadcastClient(bcast Broadcaster, orchestratorServer string, nonce uint64) error {
 	tlsConfig := &tls.Config{InsecureSkipVerify: true}
 	httpc := &http.Client{
 		Transport: &http2.Transport{TLSClientConfig: tlsConfig},
@@ -395,7 +466,8 @@ func StartBroadcastClient(bcast Broadcaster, orchestratorServer string) error {
 	return nil
 }
 
-func SubmitSegment(bcast Broadcaster, seg *stream.HLSSegment, nonce uint64) (*net.TranscodeData, error) {
+func SubmitSegment(bcast Broadcaster, seg *stream.HLSSegment, si *net.SegmentInfo) (*net.TranscodeData, error) {
+	nonce := si.SessionInfo.Nonce
 	if monitor.Enabled {
 		monitor.SegmentUploadStart(nonce, seg.SeqNo)
 	}
@@ -404,6 +476,7 @@ func SubmitSegment(bcast Broadcaster, seg *stream.HLSSegment, nonce uint64) (*ne
 		Seq:  int64(seg.SeqNo),
 		Hash: crypto.Keccak256(seg.Data),
 	}
+	var err error
 	segCreds, err := genSegCreds(bcast, bcast.Job().StreamId, segData)
 	if err != nil {
 		if monitor.Enabled {
@@ -412,7 +485,15 @@ func SubmitSegment(bcast Broadcaster, seg *stream.HLSSegment, nonce uint64) (*ne
 		return nil, err
 	}
 	ti := bcast.GetTranscoderInfo()
-	req, err := http.NewRequest("POST", ti.Transcoder+"/segment", bytes.NewBuffer(seg.Data))
+	data := seg.Data
+	if si.Turi != nil {
+		data, err = proto.Marshal(si)
+		if err != nil {
+			glog.Error("Unable to marshal ", err)
+			return nil, err
+		}
+	}
+	req, err := http.NewRequest("POST", ti.Transcoder+"/segment", bytes.NewBuffer(data))
 	if err != nil {
 		glog.Error("Could not generate trascode request to ", ti.Transcoder)
 		if monitor.Enabled {
@@ -424,9 +505,13 @@ func SubmitSegment(bcast Broadcaster, seg *stream.HLSSegment, nonce uint64) (*ne
 	req.Header.Set("Authorization", ti.AuthType)
 	req.Header.Set("Credentials", ti.Credentials)
 	req.Header.Set("Livepeer-Segment", segCreds)
-	req.Header.Set("Content-Type", "video/MP2T")
+	if si.Turi != nil {
+		req.Header.Set("Content-Type", "application/vnd+livepeer.segmentinfo")
+	} else {
+		req.Header.Set("Content-Type", "video/MP2T")
+	}
 
-	glog.Infof("Submitting segment %v : %v bytes", seg.SeqNo, len(seg.Data))
+	glog.Infof("Submitting segment %v : %v bytes", seg.SeqNo, len(data))
 	start := time.Now()
 	resp, err := hc.Do(req)
 	uploadDur := time.Since(start)
@@ -453,7 +538,7 @@ func SubmitSegment(bcast Broadcaster, seg *stream.HLSSegment, nonce uint64) (*ne
 		monitor.LogSegmentUploaded(nonce, seg.SeqNo, uploadDur)
 	}
 
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err = ioutil.ReadAll(resp.Body)
 	tookAllDur := time.Since(start)
 
 	if err != nil {

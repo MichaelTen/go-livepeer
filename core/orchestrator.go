@@ -1,6 +1,7 @@
 package core
 
 import (
+	"github.com/livepeer/go-livepeer/drivers"
 	"context"
 	"database/sql"
 	"fmt"
@@ -128,6 +129,7 @@ type TranscodeResult struct {
 	Err  error
 	Urls []string
 	Sig  []byte
+	Data [][]byte
 }
 
 type SegChanData struct {
@@ -263,8 +265,8 @@ func (n *LivepeerNode) transcodeAndCacheSeg(config transcodeConfig, ss *SignedSe
 		}
 		tProfileData[config.Profiles[i]] = tData[i]
 		newSeg := &stream.HLSSegment{SeqNo: seg.SeqNo, Name: fmt.Sprintf("%v_%d.ts", r, seg.SeqNo), Data: tData[i], Duration: seg.Duration}
-		n.VideoSource.InsertHLSSegment(r, newSeg)
 		tr.Urls = append(tr.Urls, newSeg.Name)
+		tr.Data = append(tr.Data, tData[i])
 	}
 	//Don't do the onchain stuff unless specified
 	if config.ClaimManager != nil {
@@ -314,6 +316,8 @@ func (n *LivepeerNode) transcodeSegmentLoop(job *ethTypes.Job, segChan SegmentCh
 			case <-ctx.Done():
 				// timeout; clean up goroutine here
 				jid := job.JobId.Int64()
+				mid, _ := sid.ManifestIDFromStreamID()
+				drivers.LocalStorage.EvictManifestData(string(mid))
 				glog.V(common.DEBUG).Info("Segment loop timed out; closing ", jid)
 				n.segmentMutex.Lock()
 				if _, ok := n.SegmentChans[jid]; ok {
