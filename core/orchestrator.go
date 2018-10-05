@@ -19,6 +19,7 @@ import (
 	"github.com/livepeer/go-livepeer/common"
 	"github.com/livepeer/go-livepeer/eth"
 	ethTypes "github.com/livepeer/go-livepeer/eth/types"
+	"github.com/livepeer/go-livepeer/net"
 	ffmpeg "github.com/livepeer/lpms/ffmpeg"
 	"github.com/livepeer/lpms/stream"
 )
@@ -90,6 +91,10 @@ func (orch *orchestrator) Address() ethcommon.Address {
 	return orch.address
 }
 
+func (orch *orchestrator) TranscoderSecret() string {
+	return orch.node.OrchSecret
+}
+
 func (orch *orchestrator) StreamIDs(job *ethTypes.Job) ([]StreamID, error) {
 	streamIds := make([]StreamID, len(job.Profiles))
 	sid := StreamID(job.StreamId)
@@ -107,6 +112,18 @@ func (orch *orchestrator) StreamIDs(job *ethTypes.Job) ([]StreamID, error) {
 
 func (orch *orchestrator) TranscodeSeg(job *ethTypes.Job, ss *SignedSegment) (*TranscodeResult, error) {
 	return orch.node.TranscodeSegment(job, ss)
+}
+
+func (orch *orchestrator) ServeTranscoder(stream net.Transcoder_RegisterTranscoderServer) {
+	orch.node.serveTranscoder(stream)
+}
+
+func (orch *orchestrator) TranscoderResults(tcId int64, res *RemoteTranscoderResult) {
+	remoteChan, err := orch.node.getTaskChan(tcId)
+	if err != nil {
+		return // do we need to return anything?
+	}
+	remoteChan <- res
 }
 
 func NewOrchestrator(n *LivepeerNode) *orchestrator {
@@ -134,7 +151,13 @@ type SegChanData struct {
 	res chan *TranscodeResult
 }
 
+type RemoteTranscoderResult struct {
+	Segments [][]byte
+	Err      error
+}
+
 type SegmentChan chan *SegChanData
+type TranscoderChan chan *RemoteTranscoderResult
 
 type transcodeConfig struct {
 	StrmID        string
@@ -142,6 +165,37 @@ type transcodeConfig struct {
 	ResultStrmIDs []StreamID
 	ClaimManager  eth.ClaimManager
 	JobID         *big.Int
+}
+
+func (n *LivepeerNode) getTaskChan(taskId int64) (TranscoderChan, error) {
+	n.taskMutex.Lock()
+	defer n.taskMutex.Unlock()
+	if tc, ok := n.taskChans[taskId]; ok {
+		return tc, nil
+	}
+	return nil, fmt.Errorf("No transcoder channel")
+}
+func (n *LivepeerNode) addTaskChan() (int64, TranscoderChan) {
+	n.taskMutex.Lock()
+	defer n.taskMutex.Unlock()
+	taskId := n.taskCount
+	n.taskCount++
+	if tc, ok := n.taskChans[taskId]; ok {
+		// should really never happen
+		glog.V(common.DEBUG).Info("Transcoder channel already exists for ", taskId)
+		return taskId, tc
+	}
+	n.taskChans[taskId] = make(TranscoderChan, 1)
+	return taskId, n.taskChans[taskId]
+}
+func (n *LivepeerNode) removeTaskChan(taskId int64) {
+	n.taskMutex.Lock()
+	defer n.taskMutex.Unlock()
+	if _, ok := n.taskChans[taskId]; !ok {
+		glog.V(common.DEBUG).Info("Transcoder channel nonexistent for job ", taskId)
+		return
+	}
+	delete(n.taskChans, taskId)
 }
 
 func (n *LivepeerNode) getSegmentChan(job *ethTypes.Job) (SegmentChan, error) {
@@ -236,16 +290,21 @@ func (n *LivepeerNode) transcodeAndCacheSeg(config transcodeConfig, ss *SignedSe
 	}
 	seg.Name = fmt.Sprintf("%s_%d.ts", config.StrmID, seg.SeqNo)
 	url := fmt.Sprintf("%v/stream/%s", n.ServiceURI, seg.Name)
+	n.VideoSource.InsertHLSSegment(StreamID(config.StrmID), &seg) // XXX ensure we cleanup?
 
 	// Check if there's a transcoder available
 	var transcoder Transcoder
+	n.tcoderMutex.Lock()
 	if n.Transcoder == nil {
+		n.tcoderMutex.Unlock()
 		return terr(fmt.Errorf("No transcoders available on orchestrator"))
 	}
 	transcoder = n.Transcoder
+	n.tcoderMutex.Unlock()
 
 	// Small optimization so we aren't using http for local transcoding
-	if _, ok := transcoder.(*LocalTranscoder); ok {
+	// Replace by OS
+	if _, ok := transcoder.(*RemoteTranscoder); !ok {
 		url = fname
 	}
 
@@ -372,6 +431,65 @@ func (n *LivepeerNode) GetClaimManager(job *ethTypes.Job) (eth.ClaimManager, err
 	cm := eth.NewBasicClaimManager(job, n.Eth, n.Ipfs, n.Database)
 	n.ClaimManagers[jobId] = cm
 	return cm, nil
+}
+
+func (n *LivepeerNode) serveTranscoder(stream net.Transcoder_RegisterTranscoderServer) {
+	transcoder := NewRemoteTranscoder(n, stream)
+
+	n.tcoderMutex.Lock()
+	n.Transcoder = transcoder
+	n.tcoderMutex.Unlock()
+
+	select {
+	case <-transcoder.eof:
+		glog.V(common.DEBUG).Info("Closing transcoder channel") // XXX cxn info
+		n.tcoderMutex.Lock()
+		n.Transcoder = nil
+		n.tcoderMutex.Unlock()
+		return
+	}
+}
+
+type RemoteTranscoder struct {
+	node   *LivepeerNode
+	stream net.Transcoder_RegisterTranscoderServer
+	eof    chan struct{}
+}
+
+func (rt *RemoteTranscoder) Transcode(fname string, profiles []ffmpeg.VideoProfile) ([][]byte, error) {
+	taskId, taskChan := rt.node.addTaskChan()
+	defer rt.node.removeTaskChan(taskId)
+	msg := &net.NotifySegment{
+		Url:      fname,
+		TaskId:   taskId,
+		Profiles: common.ProfilesToTranscodeOpts(profiles),
+	}
+	err := rt.stream.Send(msg)
+	if err != nil {
+		glog.Error("Error sending message to remote transcoder ", err)
+		rt.eof <- struct{}{}
+		return [][]byte{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		// XXX remove transcoder from streams
+		rt.eof <- struct{}{}
+		return [][]byte{}, fmt.Errorf("Remote transcoder took too long")
+	case chanData := <-taskChan:
+		glog.Info("Successfully received results from remote transcoder ", len(chanData.Segments))
+		return chanData.Segments, chanData.Err
+	}
+	return [][]byte{}, fmt.Errorf("Unknown error")
+}
+
+func NewRemoteTranscoder(n *LivepeerNode, stream net.Transcoder_RegisterTranscoderServer) *RemoteTranscoder {
+	return &RemoteTranscoder{
+		node:   n,
+		stream: stream,
+		eof:    make(chan struct{}, 1),
+	}
 }
 
 func randName() string {

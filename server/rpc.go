@@ -41,11 +41,15 @@ const AuthType_LPE = "Livepeer-Eth-1"
 type Orchestrator interface {
 	ServiceURI() *url.URL
 	Address() ethcommon.Address
+	TranscoderSecret() string
 	Sign([]byte) ([]byte, error)
 	CurrentBlock() *big.Int
 	GetJob(int64) (*lpTypes.Job, error)
 	TranscodeSeg(*lpTypes.Job, *core.SignedSegment) (*core.TranscodeResult, error)
 	StreamIDs(*lpTypes.Job) ([]core.StreamID, error)
+
+	ServeTranscoder(stream net.Transcoder_RegisterTranscoderServer)
+	TranscoderResults(job int64, res *core.RemoteTranscoderResult)
 }
 
 type Broadcaster interface {
@@ -341,7 +345,9 @@ func StartTranscodeServer(orch Orchestrator, bind string, mux *http.ServeMux, wo
 		transRpc:     mux,
 	}
 	net.RegisterOrchestratorServer(s, &lp)
+	net.RegisterTranscoderServer(s, &lp)
 	lp.transRpc.HandleFunc("/segment", lp.ServeSegment)
+	lp.transRpc.HandleFunc("/transcodeResults", lp.TranscodeResults)
 
 	cert, key, err := getCert(orch.ServiceURI(), workDir)
 	if err != nil {
@@ -350,10 +356,11 @@ func StartTranscodeServer(orch Orchestrator, bind string, mux *http.ServeMux, wo
 
 	glog.Info("Listening for RPC on ", bind)
 	srv := http.Server{
-		Addr:         bind,
-		Handler:      &lp,
-		ReadTimeout:  HTTPTimeout,
-		WriteTimeout: HTTPTimeout,
+		Addr:    bind,
+		Handler: &lp,
+		// XXX doesn't handle streaming RPC well; split remote transcoder RPC?
+		//ReadTimeout:  HTTPTimeout,
+		//WriteTimeout: HTTPTimeout,
 	}
 	srv.ListenAndServeTLS(cert, key)
 }
