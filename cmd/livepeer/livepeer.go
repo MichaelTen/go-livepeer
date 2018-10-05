@@ -169,7 +169,7 @@ func main() {
 	} else if transcoder {
 		n.NodeType = core.TranscoderNode
 	} else {
-		n.NodeType = core.Broadcaster
+		n.NodeType = core.BroadcasterNode
 	}
 
 	if *offchain {
@@ -254,7 +254,7 @@ func main() {
 		}
 	}
 
-	if n.NodeType == core.Broadcaster {
+	if n.NodeType == core.BroadcasterNode {
 		// default lpms listener for broadcaster; same as default rpc port
 		// TODO provide an option to disable this?
 		*rtmpAddr = defaultAddr(*rtmpAddr, "127.0.0.1", RtmpPort)
@@ -324,7 +324,7 @@ func main() {
 	switch n.NodeType {
 	case core.OrchestratorNode:
 		glog.Infof("***Livepeer Running in Orchestrator Mode***")
-	case core.Broadcaster:
+	case core.BroadcasterNode:
 		glog.Infof("***Livepeer Running in Broadcaster Mode***")
 		glog.Infof("Video Ingest Endpoint - rtmp://%v", *rtmpAddr)
 	case core.TranscoderNode:
